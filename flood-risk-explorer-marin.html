@@ -1209,6 +1209,13 @@ function initLeafletMap() {
     maxZoom: 16,
     pane: 'shadowPane', // keeps labels above the base tiles but below your markers/choropleth
   }).addTo(leafletMap);
+
+  // Dots are laid out in screen pixels, so re-fit them to each block group after every zoom
+  let zoomRedrawTimer = null;
+  leafletMap.on('zoomend', () => {
+    clearTimeout(zoomRedrawTimer);
+    zoomRedrawTimer = setTimeout(() => { if (geoFeatures) redrawOverlay(); }, 60);
+  });
 }
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
@@ -1266,6 +1273,69 @@ function geoCentroid(geometry) {
     (Math.min(...lats) + Math.max(...lats)) / 2,
     (Math.min(...lons) + Math.max(...lons)) / 2,
   ];
+}
+
+/* Interior anchor for a block group: the point deepest inside its largest polygon
+   (pole of inaccessibility) plus the radius of the largest circle that fits there.
+   Unlike a bounding-box centre, this always lies inside the shape, so overlay dots
+   stay on the correct block group even for thin, L-shaped or multi-part geometries. */
+function polyAnchor(geometry) {
+  if (!geometry) return null;
+  const polys = geometry.type === 'Polygon' ? [geometry.coordinates]
+              : geometry.type === 'MultiPolygon' ? geometry.coordinates : [];
+  if (!polys.length) return null;
+  const ringArea = r => { let a = 0; for (let i = 0, j = r.length - 1; i < r.length; j = i++) a += (r[j][0] + r[i][0]) * (r[j][1] - r[i][1]); return Math.abs(a / 2); };
+  let best = polys[0], bestA = -1;
+  polys.forEach(p => { const a = ringArea(p[0]); if (a > bestA) { bestA = a; best = p; } });
+
+  // Project to local metres so distances are true
+  const lat0 = best[0].reduce((m, c) => m + c[1], 0) / best[0].length;
+  const lng0 = best[0].reduce((m, c) => m + c[0], 0) / best[0].length;
+  const kx = Math.cos(lat0 * Math.PI / 180) * 111320, ky = 110540;
+  const rings = best.map(r => r.map(c => [(c[0] - lng0) * kx, (c[1] - lat0) * ky]));
+
+  const segDist2 = (px, py, a, b) => {
+    let x = a[0], y = a[1], dx = b[0] - x, dy = b[1] - y;
+    if (dx || dy) { const t = ((px - x) * dx + (py - y) * dy) / (dx * dx + dy * dy); if (t > 1) { x = b[0]; y = b[1]; } else if (t > 0) { x += dx * t; y += dy * t; } }
+    dx = px - x; dy = py - y; return dx * dx + dy * dy;
+  };
+  const pointDist = (px, py) => {            // signed: + inside, - outside
+    let inside = false, min = Infinity;
+    rings.forEach(r => {
+      for (let i = 0, j = r.length - 1; i < r.length; j = i++) {
+        const a = r[i], b = r[j];
+        if ((a[1] > py) !== (b[1] > py) && px < (b[0] - a[0]) * (py - a[1]) / (b[1] - a[1]) + a[0]) inside = !inside;
+        min = Math.min(min, segDist2(px, py, a, b));
+      }
+    });
+    return (inside ? 1 : -1) * Math.sqrt(min);
+  };
+
+  const xs = rings[0].map(c => c[0]), ys = rings[0].map(c => c[1]);
+  const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
+  const size = Math.min(maxX - minX, maxY - minY) || 1;
+  let h = size / 2;
+  const mkCell = (x, y, hh) => { const d = pointDist(x, y); return { x, y, h: hh, d, max: d + hh * Math.SQRT2 }; };
+  let cells = [];
+  for (let x = minX; x < maxX; x += size) for (let y = minY; y < maxY; y += size) cells.push(mkCell(x + h, y + h, h));
+  let bestCell = mkCell((minX + maxX) / 2, (minY + maxY) / 2, 0);
+  cells.forEach(c => { if (c.d > bestCell.d) bestCell = c; });
+  const precision = Math.max(0.5, size / 200);
+  let guard = 0;
+  while (cells.length && guard++ < 4000) {
+    let bi = 0; cells.forEach((c, i) => { if (c.max > cells[bi].max) bi = i; });
+    const c = cells.splice(bi, 1)[0];
+    if (c.d > bestCell.d) bestCell = c;
+    if (c.max - bestCell.d <= precision) continue;
+    const hh = c.h / 2;
+    [[-1,-1],[1,-1],[-1,1],[1,1]].forEach(([sx, sy]) => cells.push(mkCell(c.x + sx * hh, c.y + sy * hh, hh)));
+  }
+  return { lat: lat0 + bestCell.y / ky, lng: lng0 + bestCell.x / kx, r: Math.max(bestCell.d, 0) };
+}
+
+// Ground metres represented by one screen pixel at the current zoom
+function metersPerPixel(lat) {
+  return 156543.03392 * Math.cos(lat * Math.PI / 180) / Math.pow(2, leafletMap.getZoom());
 }
 
 // Approximate pixel width of a feature at current zoom (used for label visibility)
@@ -1368,39 +1438,35 @@ function redrawOverlay() {
   geoFeatures.forEach(feat => {
     if (!feat._data || !feat.geometry) return;
     const d    = feat._data;
-    const ctr  = geoCentroid(feat.geometry);
-    if (!ctr) return;
+    if (!feat._anchor) feat._anchor = polyAnchor(feat.geometry);
+    if (!feat._anchor) return;
+    const ctr  = [feat._anchor.lat, feat._anchor.lng];
 
-    // LMI dot
-    if (layers.income && d.lmi >= thresholds.lmi) {
-      markers.push(L.circleMarker(ctr, {
-        radius: 4, color: 'white', weight: 1,
-        fillColor: '#1B8E8E', fillOpacity: 1,
-        interactive: false,
-        pane: 'markerPane',
-      }));
-    }
-
-    // Renter % dot (slightly offset west, so it doesn't collide with the low take-up dot)
-    if (layers.renter && d.renterPct !== null && d.renterPct !== undefined && d.renterPct >= thresholds.renter) {
-      const offsetLng = ctr[1] - 0.005;
-      markers.push(L.circleMarker([ctr[0], offsetLng], {
-        radius: 4, color: 'white', weight: 1,
-        fillColor: '#B8336A', fillOpacity: 1,
-        interactive: false,
-        pane: 'markerPane',
-      }));
-    }
-
-    // Low NFIP take-up dot (slightly offset east)
-    if (layers.lowtakeup && hasNfipSfhaData(d) && d.nfipSFHA <= thresholds.nfip) {
-      const offsetLng = ctr[1] + 0.005;
-      markers.push(L.circleMarker([ctr[0], offsetLng], {
-        radius: 4, color: 'white', weight: 1,
-        fillColor: '#E07B2A', fillOpacity: 1,
-        interactive: false,
-        pane: 'markerPane',
-      }));
+    // Overlay dots — placed at the block group's interior anchor and sized/arranged
+    // in pixels so they always fit inside the block group at the current zoom.
+    const dots = [];
+    if (layers.income && d.lmi >= thresholds.lmi) dots.push('#1B8E8E');
+    if (layers.renter && d.renterPct !== null && d.renterPct !== undefined && d.renterPct >= thresholds.renter) dots.push('#B8336A');
+    if (layers.lowtakeup && hasNfipSfhaData(d) && d.nfipSFHA <= thresholds.nfip) dots.push('#E07B2A');
+    if (dots.length) {
+      const R = feat._anchor.r / metersPerPixel(feat._anchor.lat);   // inscribed-circle radius, px
+      const n = dots.length;
+      const fit = n === 1 ? 1 : n === 2 ? 2 : 2.155;                  // cluster extent in dot radii
+      const r = Math.max(1.3, Math.min(4.5, (R * 0.85) / fit));
+      const sep = n === 1 ? 0 : n === 2 ? r : r * 1.155;              // centre-to-cluster-centre distance
+      const base = leafletMap.latLngToLayerPoint(ctr);
+      dots.forEach((color, k) => {
+        let dx = 0, dy = 0;
+        if (n === 2) dx = (k === 0 ? -sep : sep);
+        else if (n === 3) { const ang = (-90 + k * 120) * Math.PI / 180; dx = sep * Math.cos(ang); dy = sep * Math.sin(ang); }
+        const ll = leafletMap.layerPointToLatLng(base.add([dx, dy]));
+        markers.push(L.circleMarker(ll, {
+          radius: r, color: 'white', weight: r < 3 ? 0.6 : 1,
+          fillColor: color, fillOpacity: 1,
+          interactive: false,
+          pane: 'markerPane',
+        }));
+      });
     }
 
     // Block group label
