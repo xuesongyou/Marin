@@ -141,6 +141,27 @@ body { font-family: var(--font); background: var(--slate); color: var(--text); f
   grid-column: 1; grid-row: 1;
 }
 
+
+/* ── Address search ── */
+.addr-search { position:absolute; top:12px; left:56px; width:min(380px, calc(100% - 76px)); z-index:800; font-family:inherit; }
+.addr-search form { display:flex; align-items:center; background:#fff; border-radius:10px; box-shadow:0 2px 10px rgba(14,42,71,.22), 0 0 0 1px rgba(14,42,71,.08); overflow:hidden; }
+.addr-search form:focus-within { box-shadow:0 2px 12px rgba(27,95,168,.35), 0 0 0 2px #1B5FA8; }
+.addr-search svg { flex:none; margin-left:11px; color:#5b7189; }
+.addr-search input { flex:1; min-width:0; border:0; outline:0; background:transparent; padding:10px 8px; font:500 13px/1.2 inherit; font-family:inherit; color:#0E2A47; }
+.addr-search input::placeholder { color:#8497ab; font-weight:400; }
+.addr-search .as-clear { display:none; border:0; background:none; cursor:pointer; font-size:18px; line-height:1; color:#8497ab; padding:0 6px; }
+.addr-search .as-clear:hover { color:#0E2A47; }
+.addr-search .as-go { border:0; cursor:pointer; background:#1B5FA8; color:#fff; font:600 12px inherit; font-family:inherit; padding:0 14px; align-self:stretch; }
+.addr-search .as-go:hover { background:#154d8a; }
+.addr-search .as-list { display:none; margin-top:6px; background:#fff; border-radius:10px; box-shadow:0 4px 16px rgba(14,42,71,.25); overflow:hidden; max-height:260px; overflow-y:auto; }
+.addr-search .as-list button { display:block; width:100%; text-align:left; border:0; background:#fff; padding:9px 12px; font:500 12.5px/1.35 inherit; font-family:inherit; color:#0E2A47; cursor:pointer; border-bottom:1px solid #eef2f6; }
+.addr-search .as-list button:last-child { border-bottom:0; }
+.addr-search .as-list button:hover { background:#eef5fc; }
+.addr-search .as-msg { padding:10px 12px; font-size:12.5px; color:#5b7189; }
+.addr-pin { width:26px; height:26px; }
+.addr-pin div { width:26px; height:26px; border-radius:50% 50% 50% 0; background:#C0392B; transform:rotate(-45deg); box-shadow:0 2px 6px rgba(0,0,0,.4); border:2px solid #fff; position:relative; }
+.addr-pin div::after { content:''; position:absolute; width:8px; height:8px; border-radius:50%; background:#fff; top:50%; left:50%; margin:-4px 0 0 -4px; }
+
 /* Leaflet map fills container */
 #leaflet-map { width: 100%; height: 100%; }
 
@@ -796,6 +817,16 @@ table.data-table tr.med-risk td { background: rgba(224,123,42,.05); }
         <div class="map-wrap" id="map-container">
           <!-- Leaflet base map (overlay drawn natively inside Leaflet SVG pane) -->
           <div id="leaflet-map"></div>
+          <!-- Address search -->
+          <div class="addr-search" id="addr-search">
+            <form id="addr-form" autocomplete="off">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+              <input id="addr-input" type="text" placeholder="Search an address in Marin County…" aria-label="Search address">
+              <button type="button" class="as-clear" id="addr-clear" title="Clear" aria-label="Clear search">&times;</button>
+              <button type="submit" class="as-go">Search</button>
+            </form>
+            <div class="as-list" id="addr-list"></div>
+          </div>
           <!-- States -->
           <div class="no-community-msg" id="no-community">
             <div class="big-icon">🏘</div>
@@ -1216,7 +1247,99 @@ function initLeafletMap() {
     clearTimeout(zoomRedrawTimer);
     zoomRedrawTimer = setTimeout(() => { if (geoFeatures) redrawOverlay(); }, 60);
   });
+
+  initAddressSearch();
 }
+
+/* ── Address search (OpenStreetMap Nominatim, limited to Marin County) ── */
+let addrPin = null;
+
+function pointInGeometry(lng, lat, geom) {
+  const inRing = ring => {
+    let inside = false;
+    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      const xi = ring[i][0], yi = ring[i][1], xj = ring[j][0], yj = ring[j][1];
+      if ((yi > lat) !== (yj > lat) && lng < (xj - xi) * (lat - yi) / (yj - yi) + xi) inside = !inside;
+    }
+    return inside;
+  };
+  const inPoly = rings => inRing(rings[0]) && !rings.slice(1).some(inRing);
+  if (geom.type === 'Polygon') return inPoly(geom.coordinates);
+  if (geom.type === 'MultiPolygon') return geom.coordinates.some(inPoly);
+  return false;
+}
+
+function goToAddress(lat, lng, label) {
+  if (addrPin) { leafletMap.removeLayer(addrPin); addrPin = null; }
+  addrPin = L.marker([lat, lng], {
+    icon: L.divIcon({ className: 'addr-pin', html: '<div></div>', iconSize: [26, 26], iconAnchor: [13, 26] }),
+    keyboard: false, title: label || '',
+  }).addTo(leafletMap);
+  leafletMap.flyTo([lat, lng], 17, { duration: 1.0 });
+
+  // Select the block group that contains the address
+  const hit = (geoFeatures || []).find(f => f._data && f.geometry && pointInGeometry(lng, lat, f.geometry));
+  if (hit) {
+    selectedBg = hit._data.geoid;
+    if (typeof refreshBgStyles === 'function') refreshBgStyles();
+    selectBg(hit._data);
+    updateTopBgs();
+  }
+}
+
+function initAddressSearch() {
+  const box = document.getElementById('addr-search');
+  if (!box) return;
+  const form = document.getElementById('addr-form'), input = document.getElementById('addr-input');
+  const list = document.getElementById('addr-list'), clear = document.getElementById('addr-clear');
+  L.DomEvent.disableClickPropagation(box);
+  L.DomEvent.disableScrollPropagation(box);
+
+  const showMsg = t => { list.innerHTML = ''; const m = document.createElement('div'); m.className = 'as-msg'; m.textContent = t; list.appendChild(m); list.style.display = 'block'; };
+  const hide = () => { list.style.display = 'none'; list.innerHTML = ''; };
+
+  input.addEventListener('input', () => { clear.style.display = input.value ? 'block' : 'none'; });
+  input.addEventListener('keydown', e => { if (e.key === 'Escape') hide(); });
+  clear.addEventListener('click', () => {
+    input.value = ''; clear.style.display = 'none'; hide();
+    if (addrPin) { leafletMap.removeLayer(addrPin); addrPin = null; }
+    input.focus();
+  });
+
+  form.addEventListener('submit', async e => {
+    e.preventDefault();
+    const q = input.value.trim();
+    if (!q) return;
+    showMsg('Searching…');
+    try {
+      // viewbox = Marin County (west,north,east,south); bounded keeps results inside the county
+      const url = 'https://nominatim.openstreetmap.org/search?format=jsonv2&limit=6&countrycodes=us&addressdetails=0'
+                + '&viewbox=-123.03,38.33,-122.34,37.81&bounded=1&q=' + encodeURIComponent(q);
+      const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      let data = await res.json();
+      if (!data.length && !/marin|ca\b|california/i.test(q)) {
+        const res2 = await fetch(url.replace(/&q=.*$/, '') + '&q=' + encodeURIComponent(q + ', Marin County, California'));
+        if (res2.ok) data = await res2.json();
+      }
+      if (!data.length) { showMsg('No match found in Marin County. Try adding a street number and city.'); return; }
+      if (data.length === 1) { hide(); goToAddress(+data[0].lat, +data[0].lon, data[0].display_name); return; }
+      list.innerHTML = '';
+      data.forEach(r => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = r.display_name.replace(/, United States$/, '');
+        b.addEventListener('click', () => { hide(); input.value = b.textContent; clear.style.display = 'block'; goToAddress(+r.lat, +r.lon, r.display_name); });
+        list.appendChild(b);
+      });
+      list.style.display = 'block';
+    } catch (err) {
+      console.warn('Address search failed', err);
+      showMsg('Search is unavailable right now. Please try again in a moment.');
+    }
+  });
+}
+
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
